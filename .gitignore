@@ -1,0 +1,27 @@
+# Environment variables - never commit the real .env
+.env
+
+# Keep the example file tracked
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# ChromaDB local data
+chroma_db/
+
+# Jupyter Notebooks checkpoints
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
