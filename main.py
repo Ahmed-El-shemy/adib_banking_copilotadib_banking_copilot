@@ -1,19 +1,32 @@
 import json
 import os
 import chromadb
+import imaplib
+import smtplib
+import email
+from email.message import EmailMessage
+from email.header import decode_header
 
 from dotenv import load_dotenv
 from openai import OpenAI
 from langchain_openai import ChatOpenAI
 from langchain_chroma import Chroma
 from langchain_community.embeddings import SentenceTransformerEmbeddings
-from langchain.schema import Document
+from langchain_core.documents import Document
 
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MODEL_NAME = "openai/gpt-oss-120b"
 BASE_URL = "https://api.groq.com/openai/v1"
+
+# NEW: Load email credentials and server details from environment variables
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+IMAP_SERVER = os.getenv("IMAP_SERVER", "imap.gmail.com")
+IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 
 
 # ─────────────────────────────────────────────
@@ -227,6 +240,96 @@ Write the outgoing email response now:
 
 
 # ─────────────────────────────────────────────
+# 6. Email Operations (IMAP/SMTP)
+# ─────────────────────────────────────────────
+
+def fetch_unread_emails():
+    # NEW: Fetch unread emails from the IMAP server
+    if not EMAIL_ADDRESS or not EMAIL_PASSWORD:
+        print("Email credentials not set. Cannot fetch emails.")
+        return []
+
+    try:
+        # NEW: Connect to IMAP server using SSL
+        mail = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
+        mail.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+        mail.select('inbox')
+
+        status, response = mail.search(None, 'UNSEEN')
+        unread_email_ids = response[0].split()
+        
+        emails = []
+        for num in unread_email_ids:
+            status, data = mail.fetch(num, '(RFC822)')
+            msg = email.message_from_bytes(data[0][1])
+            
+            # Decode subject
+            subject, encoding = decode_header(msg['subject'])[0]
+            if isinstance(subject, bytes):
+                subject = subject.decode(encoding if encoding else 'utf-8')
+                
+            sender = msg['from']
+            body = ""
+            
+            if msg.is_multipart():
+                for part in msg.walk():
+                    content_type = part.get_content_type()
+                    content_disposition = str(part.get("Content-Disposition"))
+                    
+                    if content_type == "text/plain" and "attachment" not in content_disposition:
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            body = payload.decode(errors='ignore')
+                        break
+            else:
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    body = payload.decode(errors='ignore')
+                
+            emails.append({
+                'id': num,
+                'subject': subject,
+                'sender': sender,
+                'body': body,
+                'mail_client': mail
+            })
+            
+        return emails
+    except Exception as e:
+        print(f"Error fetching emails: {e}")
+        return []
+
+def mark_email_as_read(mail_client, email_id):
+    # NEW: Mark an email as read on the IMAP server so it is not processed again
+    try:
+        mail_client.store(email_id, '+FLAGS', '\\Seen')
+    except Exception as e:
+        print(f"Error marking email as read: {e}")
+
+def send_email_reply(to_address, subject, body):
+    # NEW: Send an email reply using the SMTP server via SSL (Port 465)
+    if not EMAIL_ADDRESS or not EMAIL_PASSWORD:
+        print("Email credentials not set. Cannot send reply.")
+        return
+
+    try:
+        msg = EmailMessage()
+        msg.set_content(body)
+        msg['Subject'] = f"Re: {subject}"
+        msg['From'] = EMAIL_ADDRESS
+        msg['To'] = to_address
+
+        # NEW: Use SMTP_SSL instead of starttls() for port 465
+        server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
+        server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        print(f"Reply successfully sent to {to_address}")
+    except Exception as e:
+        print(f"Error sending email reply: {e}")
+
+
+# ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
 
@@ -238,49 +341,41 @@ def main():
     # Print document count
     print(f"Documents in ChromaDB collection: {vectorstore._collection.count()}\n")
 
-    # Sample customer emails
-    sample_emails = [
-        {
-            "label": "Email 1 - Card Activation",
-            "text": (
-                "Hello,\n\n"
-                "My name is Sara Ahmed. I just received my new ADIB debit card in the mail "
-                "and I would like to know how to activate it. Can you please guide me through "
-                "the activation process?\n\n"
-                "Thank you,\nSara Ahmed"
-            )
-        },
-        {
-            "label": "Email 2 - Cashback Inquiry",
-            "text": (
-                "Hi,\n\n"
-                "I am Khalid Hassan. I heard that ADIB offers cash back cards and I am "
-                "interested in learning more about how the cashback program works and what "
-                "categories are eligible. Could you please provide details?\n\n"
-                "Best regards,\nKhalid Hassan"
-            )
-        }
-    ]
+    print("Checking for unread emails...")
+    # NEW: Fetch unread emails from an email inbox (IMAP).
+    unread_emails = fetch_unread_emails()
+    
+    if not unread_emails:
+        print("No new emails found.")
+        return
 
-    for email_info in sample_emails:
-        label = email_info["label"]
-        email_text = email_info["text"]
+    # NEW: Loop through each unread email for processing
+    for email_info in unread_emails:
+        # NEW: Read sender email, subject, and body
+        email_id = email_info["id"]
+        sender = email_info["sender"]
+        subject = email_info["subject"]
+        email_text = email_info["body"]
+        mail_client = email_info["mail_client"]
 
         print("=" * 40)
         print(f"========== Incoming Email ==========")
-        print(f"[{label}]")
+        print(f"From: {sender}")
+        print(f"Subject: {subject}")
+        print("Body:")
         print(email_text)
 
-        # Extract fields using function calling
+        # NEW: Pass the email body to the existing extract_email_fields() function
         extracted_fields = extract_email_fields(email_text)
 
         print("\n========== Extracted Fields ==========")
         print(json.dumps(extracted_fields, indent=2))
 
+        # NEW: Determine the request type
         request_type = extracted_fields.get("request_type", "").lower()
 
+        # NEW: Route flow if the request type is an Inquiry
         if "inquiry" in request_type or "inquir" in request_type:
-            # Inquiry path: search ChromaDB -> Researcher -> Resolver -> Reviewer
             print("\n[Route: Inquiry]")
 
             search_query = extracted_fields.get("request_type", email_text)
@@ -299,10 +394,9 @@ def main():
 
             resolver_output = resolver_agent(email_text, extracted_fields, researcher_summary)
 
+        # NEW: Otherwise, route flow for Non-Inquiry (Skip Knowledge Base)
         else:
-            # Non-inquiry path: skip ChromaDB and Researcher -> Resolver -> Reviewer
             print("\n[Route: Non-Inquiry]")
-
             resolver_output = resolver_agent(email_text, extracted_fields)
 
         print("\n========== Resolver Response ==========")
@@ -315,6 +409,16 @@ def main():
 
         print("\n========== OUTGOING EMAIL ==========")
         print(final_email)
+        
+        # NEW: Send the final response back to the original sender using SMTP
+        print("\nSending email reply...")
+        send_email_reply(sender, subject, final_email)
+        
+        # NEW: Mark the processed email as Read
+        print("Marking email as read...")
+        mark_email_as_read(mail_client, email_id)
+        
+        # NEW: Continue processing the next unread email
         print("\n" + "=" * 40 + "\n")
 
 
